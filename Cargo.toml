@@ -1,0 +1,13 @@
+[package]
+name = "include_wgsl"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+nom = "8"
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }
