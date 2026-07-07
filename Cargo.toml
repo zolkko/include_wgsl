@@ -8,6 +8,7 @@ proc-macro = true
 
 [dependencies]
 nom = "8"
+naga = { version = "30.0.0", features = ["wgsl-in", "spv-out"] }
 proc-macro2 = "1"
 quote = "1"
 syn = { version = "2", features = ["full"] }

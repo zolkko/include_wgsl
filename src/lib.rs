@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::error::Error;
 use std::path::{Path, PathBuf};
 
 use nom::IResult;
@@ -7,6 +8,44 @@ use nom::character::complete::{char, space0, space1};
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{LitStr, parse_macro_input};
+
+/// Precompiles WGSL string to SPIR-V shader language.
+///
+/// ```ignore
+/// static SPIR_V_SHADER: &[u32] = wgsl_to_spirv!(include_wgsl!("shaders/main.wgsl"));
+/// ```
+#[proc_macro]
+pub fn wgsl_to_spirv(input: TokenStream) -> TokenStream {
+    let lit = parse_macro_input!(input as LitStr);
+
+    fn inner(value: &str) -> Result<TokenStream, Box<dyn Error>> {
+        let module: naga::Module = naga::front::wgsl::parse_str(value)?;
+        let module_info = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .subgroup_stages(naga::valid::ShaderStages::all())
+        .subgroup_operations(naga::valid::SubgroupOperationSet::all())
+        .validate(&module)?;
+
+        let spv_source = naga::back::spv::write_vec(
+            &module,
+            &module_info,
+            &naga::back::spv::Options::default(),
+            None,
+        )?;
+
+        Ok(quote! {
+            [ #(#spv_source),* ]
+        }
+        .into())
+    }
+
+    match inner(&lit.value()) {
+        Ok(ts) => ts,
+        Err(err) => syn::Error::new(lit.span(), err).into_compile_error().into(),
+    }
+}
 
 /// Includes a WGSL file as a `&'static str`, resolving `// include "path"`
 /// directives recursively, similarly to `include_str!`.
