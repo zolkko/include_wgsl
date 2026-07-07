@@ -9,41 +9,58 @@ use proc_macro::TokenStream;
 use quote::quote;
 use syn::{LitStr, parse_macro_input};
 
-/// Precompiles WGSL string to SPIR-V shader language.
+/// Includes a WGSL shader and precompiles it to SPIR-V shader language.
 ///
 /// ```ignore
-/// static SPIR_V_SHADER: &[u32] = wgsl_to_spirv!(include_wgsl!("shaders/main.wgsl"));
+/// static SPIR_V_SHADER: &[u32] = include_wgsl_as_spirv!("shaders/main.wgsl");
 /// ```
 #[proc_macro]
-pub fn wgsl_to_spirv(input: TokenStream) -> TokenStream {
+pub fn include_wgsl_as_spirv(input: TokenStream) -> TokenStream {
     let lit = parse_macro_input!(input as LitStr);
 
-    fn inner(value: &str) -> Result<TokenStream, Box<dyn Error>> {
-        let module: naga::Module = naga::front::wgsl::parse_str(value)?;
-        let module_info = naga::valid::Validator::new(
-            naga::valid::ValidationFlags::all(),
-            naga::valid::Capabilities::all(),
-        )
-        .subgroup_stages(naga::valid::ShaderStages::all())
-        .subgroup_operations(naga::valid::SubgroupOperationSet::all())
-        .validate(&module)?;
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
+    let root_path = Path::new(&manifest_dir).join(lit.value());
 
-        let spv_source = naga::back::spv::write_vec(
-            &module,
-            &module_info,
-            &naga::back::spv::Options::default(),
-            None,
-        )?;
+    let mut stack = Vec::new();
+    let mut seen = HashSet::new();
 
-        Ok(quote! {
-            [ #(#spv_source),* ]
-        }
-        .into())
-    }
+    into_token_stream(
+        resolve_includes(&root_path, &mut stack, &mut seen)
+            .and_then(|source| convert_to_spirv(&source).map(VecAsArray)),
+        lit.span(),
+        seen,
+    )
+}
 
-    match inner(&lit.value()) {
-        Ok(ts) => ts,
-        Err(err) => syn::Error::new(lit.span(), err).into_compile_error().into(),
+fn convert_to_spirv(value: &str) -> Result<Vec<u32>, Box<dyn Error>> {
+    let module: naga::Module = naga::front::wgsl::parse_str(value)?;
+    let module_info = naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::all(),
+    )
+    .subgroup_stages(naga::valid::ShaderStages::all())
+    .subgroup_operations(naga::valid::SubgroupOperationSet::all())
+    .validate(&module)?;
+
+    let spv_source = naga::back::spv::write_vec(
+        &module,
+        &module_info,
+        &naga::back::spv::Options::default(),
+        None,
+    )?;
+
+    Ok(spv_source)
+}
+
+struct VecAsArray<T>(Vec<T>);
+
+impl<T> quote::ToTokens for VecAsArray<T>
+where
+    T: quote::ToTokens,
+{
+    fn to_tokens(&self, tokens: &mut proc_macro2::TokenStream) {
+        let elements = &self.0;
+        tokens.extend(quote! { [#(#elements),*] });
     }
 }
 
@@ -66,49 +83,27 @@ pub fn include_wgsl(input: TokenStream) -> TokenStream {
 
     let mut stack = Vec::new();
     let mut seen = HashSet::new();
-    let mut touched = Vec::new();
-
-    match resolve_includes(&root_path, &mut stack, &mut seen, &mut touched) {
-        Ok(source) => {
-            let tracked = touched.iter().map(|path| {
-                let path = path.to_string_lossy().into_owned();
-                quote! { const _: &str = include_str!(#path); }
-            });
-
-            quote! {
-                {
-                    #(#tracked)*
-                    #source
-                }
-            }
-            .into()
-        }
-        Err(message) => syn::Error::new(lit.span(), message)
-            .to_compile_error()
-            .into(),
-    }
+    into_token_stream(
+        resolve_includes(&root_path, &mut stack, &mut seen),
+        lit.span(),
+        seen,
+    )
 }
 
 fn resolve_includes(
     path: &Path,
     stack: &mut Vec<PathBuf>,
     seen: &mut HashSet<PathBuf>,
-    touched: &mut Vec<PathBuf>,
-) -> Result<String, String> {
+) -> Result<String, Box<dyn Error>> {
     let canonical = path
         .canonicalize()
         .map_err(|err| format!("failed to read `{}`: {err}", path.display()))?;
 
     if stack.contains(&canonical) {
-        return Err(format!(
-            "circular #include detected for `{}`",
-            canonical.display()
-        ));
+        return Err(format!("circular include detected for `{}`", canonical.display()).into());
     }
 
-    if seen.insert(canonical.clone()) {
-        touched.push(canonical.clone());
-    }
+    seen.insert(canonical.clone());
 
     let content = std::fs::read_to_string(&canonical)
         .map_err(|err| format!("failed to read `{}`: {err}", canonical.display()))?;
@@ -122,7 +117,7 @@ fn resolve_includes(
         match parse_include_directive(line) {
             Some(include_path) => {
                 let nested_path = dir.join(include_path);
-                let nested = resolve_includes(&nested_path, stack, seen, touched)?;
+                let nested = resolve_includes(&nested_path, stack, seen)?;
                 output.push_str(&nested);
                 if !nested.ends_with('\n') {
                     output.push('\n');
@@ -155,5 +150,33 @@ fn parse_include_directive(line: &str) -> Option<&str> {
     match directive(line) {
         Ok((rest, path)) if rest.trim().is_empty() => Some(path),
         _ => None,
+    }
+}
+
+fn into_token_stream<T>(
+    input: Result<T, Box<dyn Error>>,
+    input_span: proc_macro2::Span,
+    touched: impl IntoIterator<Item = PathBuf>,
+) -> TokenStream
+where
+    T: quote::ToTokens,
+{
+    match input {
+        Ok(source) => {
+            let tracked = touched.into_iter().map(|path| {
+                let path = path.to_string_lossy().into_owned();
+                quote! { const _: &str = include_str!(#path); }
+            });
+            quote! {
+                {
+                    #(#tracked)*
+                    #source
+                }
+            }
+            .into()
+        }
+        Err(message) => syn::Error::new(input_span, message)
+            .to_compile_error()
+            .into(),
     }
 }
